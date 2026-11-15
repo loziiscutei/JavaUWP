@@ -46,11 +46,7 @@ constexpr double kSendIntervalSeconds = 1.0 / 240.0;
 constexpr double kHeldButtonRefreshSeconds = 1.0 / 20.0;
 constexpr double kConnectProbeSeconds = 0.25;
 constexpr double kConnectTimeoutSeconds = 3.0;
-#ifdef BANDIT_MOUSE_RELAY_TOUCH
-constexpr double kRenderIntervalSeconds = 1.0 / 15.0;  // render runs on the input thread; present stalls cause bursty touch events
-#else
 constexpr double kRenderIntervalSeconds = 1.0 / 30.0;
-#endif
 constexpr double kButtonHoldSeconds = 1.0;
 constexpr double kTouchScrollRepeatSeconds = 1.0 / 12.0;
 constexpr float kMenuCoordinateScale = 0.5f;
@@ -62,6 +58,11 @@ constexpr float kTouchScrollStep = 1.0f;
 // raise if still slow, lower if too fast.
 constexpr float kTouchGameplayGain = 3.0f;
 constexpr float kTouchMenuGain = 1.5f;
+// touchscreens report ~60-120 times/s, each report used to go out as one jump. this sends
+// that fraction of the pending motion every 240hz tick and carries the rest, so movement
+// is spread over a few ticks instead of arriving in steps. 1.0 = old behavior.
+constexpr float kTouchSpread = 0.3f;
+constexpr bool kHideTouchButtons = true;  // hides the bottom + side buttons on touch
 
 #ifdef BANDIT_MOUSE_RELAY_TOUCH
 constexpr bool kTouchLayout = true;
@@ -888,6 +889,9 @@ private:
             if (menuOpen_) {
                 return BuildMenuButtons(uiWidth, uiHeight);
             }
+            if (kHideTouchButtons) {
+                return buttons;  // no on-screen buttons: nothing drawn, nothing tappable
+            }
             const float margin = 16.0f;
             const float utilityWidth = 118.0f;
             const float utilityHeight = 44.0f;
@@ -1674,9 +1678,17 @@ private:
             const float scroll = pendingScroll_;
             pendingScroll_ = 0.0f;
 
+            float sendDx = accumDx_;
+            float sendDy = accumDy_;
+            if (kTouchLayout && mode_ != RelayMode::Menu &&
+                (std::fabs(accumDx_) + std::fabs(accumDy_)) >= 1.0f) {
+                sendDx = accumDx_ * kTouchSpread;
+                sendDy = accumDy_ * kTouchSpread;
+            }
+
             const std::string packet = mode_ == RelayMode::Menu
                 ? FormatAbsPacket(virtualX_, virtualY_, packetButtons, scroll)
-                : FormatPacket(accumDx_, accumDy_, packetButtons, scroll);
+                : FormatPacket(sendDx, sendDy, packetButtons, scroll);
 
             if (!transport_.Send(packet)) {
                 pendingScroll_ += scroll;
@@ -1684,9 +1696,15 @@ private:
             }
             ++sentPackets_;
 
-            accumDx_ = 0.0f;
-            accumDy_ = 0.0f;
-            motionPending_ = false;
+            if (mode_ == RelayMode::Menu) {
+                accumDx_ = 0.0f;
+                accumDy_ = 0.0f;
+                motionPending_ = false;
+            } else {
+                accumDx_ -= sendDx;
+                accumDy_ -= sendDy;
+                motionPending_ = (accumDx_ != 0.0f || accumDy_ != 0.0f);
+            }
             if (lastSendStamp_ > 0.0) {
                 const double dtMs = (now - lastSendStamp_) * 1000.0;
                 (void)dtMs;
