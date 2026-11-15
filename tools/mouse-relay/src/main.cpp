@@ -42,7 +42,7 @@ constexpr uint16_t kInputPort = 7331;
 constexpr uint16_t kStatusPort = 7332;
 constexpr float kTargetWidth = 1920.0f;
 constexpr float kTargetHeight = 1080.0f;
-constexpr double kSendIntervalSeconds = 1.0 / 240.0;
+constexpr double kSendIntervalSeconds = 1.0 / 300.0;
 constexpr double kHeldButtonRefreshSeconds = 1.0 / 20.0;
 constexpr double kConnectProbeSeconds = 0.25;
 constexpr double kConnectTimeoutSeconds = 3.0;
@@ -56,12 +56,15 @@ constexpr float kTouchScrollStep = 1.0f;
 // touch sensitivity: a finger delta is normalized to the screen, so a full-width swipe only
 // moved ~1920 target px. these multiply that so you don't need a huge DPI on the Xbox/game.
 // raise if still slow, lower if too fast.
-constexpr float kTouchGameplayGain = 3.0f;
-constexpr float kTouchMenuGain = 1.5f;
-// touchscreens report ~60-120 times/s, each report used to go out as one jump. this sends
-// that fraction of the pending motion every 240hz tick and carries the rest, so movement
-// is spread over a few ticks instead of arriving in steps. 1.0 = old behavior.
-constexpr float kTouchSpread = 0.3f;
+constexpr float kTouchGameplayGain = 5.0f;
+constexpr float kTouchMenuGain = 2.0f;
+// touch motion smoothing: each finger report is spread evenly over the time until the next
+// report is expected (measured live from event timestamps) instead of landing as one jump.
+// output rate matches the touch rate with about half a report interval of added delay.
+// lower = snappier but more stepped, higher = smoother but laggier. max ~1.0.
+constexpr double kTouchSmoothFactor = 0.8;
+constexpr double kTouchSmoothMinSeconds = 0.002;
+constexpr double kTouchSmoothMaxSeconds = 0.016;
 constexpr bool kHideTouchButtons = true;  // hides the bottom + side buttons on touch
 
 #ifdef BANDIT_MOUSE_RELAY_TOUCH
@@ -733,8 +736,13 @@ public:
             return;
         case SDL_EVENT_FINGER_MOTION:
             if (!enteringIp_ && !menuOpen_ && !IsTouchControlFinger(event.tfinger.fingerID)) {
-                const float gain = (mode_ == RelayMode::Menu) ? kTouchMenuGain : kTouchGameplayGain;
-                AddMotion(event.tfinger.dx * static_cast<float>(windowWidth_) * gain, event.tfinger.dy * static_cast<float>(windowHeight_) * gain);
+                const float rawDx = event.tfinger.dx * static_cast<float>(windowWidth_);
+                const float rawDy = event.tfinger.dy * static_cast<float>(windowHeight_);
+                if (mode_ == RelayMode::Menu) {
+                    AddMotion(rawDx * kTouchMenuGain, rawDy * kTouchMenuGain);
+                } else {
+                    AddSmoothedTouchMotion(rawDx * kTouchGameplayGain * scaleX_, rawDy * kTouchGameplayGain * scaleY_, event.tfinger.timestamp);
+                }
             }
             return;
         default:
@@ -1345,6 +1353,7 @@ private:
         pendingScroll_ = 0.0f;
         accumDx_ = 0.0f;
         accumDy_ = 0.0f;
+        motionSlots_.clear();
         motionPending_ = false;
         lastSentButtons_.fill(-1);
         ipError_ = "Checking for Bandit launcher at " + candidate + "...";
@@ -1400,6 +1409,7 @@ private:
         pendingScroll_ = 0.0f;
         accumDx_ = 0.0f;
         accumDy_ = 0.0f;
+        motionSlots_.clear();
         motionPending_ = false;
         menuOpen_ = true;
         SetMouseCapture(false);
@@ -1411,6 +1421,62 @@ private:
         }
         menuOpen_ = false;
         SetMouseCapture(true);
+    }
+
+    void AddSmoothedTouchMotion(float dx, float dy, Uint64 timestampNs) {
+        if (lastFingerTsNs_ != 0 && timestampNs > lastFingerTsNs_) {
+            const double dt = static_cast<double>(timestampNs - lastFingerTsNs_) * 1e-9;
+            if (dt >= 0.05) {
+                fingerIntervalSeconds_ = 0.008;  // new stroke, restart the estimate
+            } else if (dt > 0.001) {
+                // burst-delivered events (dt ~0) are ignored so they cannot shrink the estimate
+                fingerIntervalSeconds_ = fingerIntervalSeconds_ * 0.7 + dt * 0.3;
+            }
+        }
+        lastFingerTsNs_ = timestampNs;
+        if (dx == 0.0f && dy == 0.0f) {
+            return;
+        }
+        const double duration = Clamp(static_cast<float>(fingerIntervalSeconds_ * kTouchSmoothFactor),
+            static_cast<float>(kTouchSmoothMinSeconds), static_cast<float>(kTouchSmoothMaxSeconds));
+        motionSlots_.push_back(MotionSlot{ dx, dy, duration, NowSeconds() });
+        motionPending_ = true;
+    }
+
+    // runs every send tick: releases each slot's share for the time that passed since it last ran
+    void DrainTouchMotion(double now) {
+        if (motionSlots_.empty()) {
+            return;
+        }
+        if (mode_ == RelayMode::Menu) {
+            motionSlots_.clear();
+            return;
+        }
+        float outX = 0.0f;
+        float outY = 0.0f;
+        for (size_t i = 0; i < motionSlots_.size();) {
+            MotionSlot& slot = motionSlots_[i];
+            const double elapsed = std::max(0.0, now - slot.last);
+            slot.last = now;
+            if (slot.remaining <= 1e-6 || elapsed >= slot.remaining) {
+                outX += slot.x;
+                outY += slot.y;
+                motionSlots_.erase(motionSlots_.begin() + static_cast<std::ptrdiff_t>(i));
+                continue;
+            }
+            const float fraction = static_cast<float>(elapsed / slot.remaining);
+            const float ex = slot.x * fraction;
+            const float ey = slot.y * fraction;
+            outX += ex;
+            outY += ey;
+            slot.x -= ex;
+            slot.y -= ey;
+            slot.remaining -= elapsed;
+            ++i;
+        }
+        accumDx_ += outX;
+        accumDy_ += outY;
+        motionPending_ = true;
     }
 
     void AddMotion(float rawDx, float rawDy) {
@@ -1666,6 +1732,8 @@ private:
             }
         }
 
+        DrainTouchMotion(now);
+
         // no time gate, the loop already ticks at this interval and a late wake doubles up
         const bool motionDue = motionPending_;
         const bool heldRefreshDue = (now - lastHeldButtonRefresh_) >= kHeldButtonRefreshSeconds;
@@ -1678,17 +1746,9 @@ private:
             const float scroll = pendingScroll_;
             pendingScroll_ = 0.0f;
 
-            float sendDx = accumDx_;
-            float sendDy = accumDy_;
-            if (kTouchLayout && mode_ != RelayMode::Menu &&
-                (std::fabs(accumDx_) + std::fabs(accumDy_)) >= 1.0f) {
-                sendDx = accumDx_ * kTouchSpread;
-                sendDy = accumDy_ * kTouchSpread;
-            }
-
             const std::string packet = mode_ == RelayMode::Menu
                 ? FormatAbsPacket(virtualX_, virtualY_, packetButtons, scroll)
-                : FormatPacket(sendDx, sendDy, packetButtons, scroll);
+                : FormatPacket(accumDx_, accumDy_, packetButtons, scroll);
 
             if (!transport_.Send(packet)) {
                 pendingScroll_ += scroll;
@@ -1696,15 +1756,9 @@ private:
             }
             ++sentPackets_;
 
-            if (mode_ == RelayMode::Menu) {
-                accumDx_ = 0.0f;
-                accumDy_ = 0.0f;
-                motionPending_ = false;
-            } else {
-                accumDx_ -= sendDx;
-                accumDy_ -= sendDy;
-                motionPending_ = (accumDx_ != 0.0f || accumDy_ != 0.0f);
-            }
+            accumDx_ = 0.0f;
+            accumDy_ = 0.0f;
+            motionPending_ = false;
             if (lastSendStamp_ > 0.0) {
                 const double dtMs = (now - lastSendStamp_) * 1000.0;
                 (void)dtMs;
@@ -1747,6 +1801,7 @@ private:
         virtualY_ = Clamp(y, 0.0f, MenuTargetHeight() - 1.0f);
         accumDx_ = 0.0f;
         accumDy_ = 0.0f;
+        motionSlots_.clear();
         motionPending_ = false;
 
         if (!fromStatus && transport_.IsOpen()) {
@@ -1933,6 +1988,15 @@ private:
     float pixelDensity_ = 1.0f;
     float scaleX_ = 1.0f;
     float scaleY_ = 1.0f;
+    struct MotionSlot {
+        float x;
+        float y;
+        double remaining;
+        double last;
+    };
+    std::vector<MotionSlot> motionSlots_;
+    Uint64 lastFingerTsNs_ = 0;
+    double fingerIntervalSeconds_ = 0.008;
     float targetWidth_ = kTargetWidth;
     float targetHeight_ = kTargetHeight;
     float menuTargetWidth_ = kTargetWidth * kMenuCoordinateScale;
@@ -2039,7 +2103,9 @@ int main(int, char**) {
     {
         RelayApp app(window, renderer);
         double lastRender = -kRenderIntervalSeconds;
+#ifndef BANDIT_MOUSE_RELAY_TOUCH
         double nextTick = NowSeconds();
+#endif
         while (app.Running()) {
             app.PumpAndTick();
             const double now = NowSeconds();
@@ -2048,11 +2114,17 @@ int main(int, char**) {
                 lastRender = now;
             }
 
+#ifdef BANDIT_MOUSE_RELAY_TOUCH
+            // sleeps in the kernel until a touch/event arrives or 1ms passes, so input is
+            // handled right away instead of waiting for the next fixed tick
+            SDL_WaitEventTimeout(nullptr, 1);
+#else
             nextTick += kSendIntervalSeconds;
             if (nextTick < now) {
                 nextTick = now;
             }
             SleepUntil(nextTick);
+#endif
         }
     }
 
