@@ -46,13 +46,22 @@ constexpr double kSendIntervalSeconds = 1.0 / 240.0;
 constexpr double kHeldButtonRefreshSeconds = 1.0 / 20.0;
 constexpr double kConnectProbeSeconds = 0.25;
 constexpr double kConnectTimeoutSeconds = 3.0;
+#ifdef BANDIT_MOUSE_RELAY_TOUCH
+constexpr double kRenderIntervalSeconds = 1.0 / 15.0;  // render runs on the input thread; present stalls cause bursty touch events
+#else
 constexpr double kRenderIntervalSeconds = 1.0 / 30.0;
+#endif
 constexpr double kButtonHoldSeconds = 1.0;
 constexpr double kTouchScrollRepeatSeconds = 1.0 / 12.0;
 constexpr float kMenuCoordinateScale = 0.5f;
 constexpr float kDebugGlyphWidth = 8.0f;
 constexpr float kDebugGlyphHeight = 8.0f;
 constexpr float kTouchScrollStep = 1.0f;
+// touch sensitivity: a finger delta is normalized to the screen, so a full-width swipe only
+// moved ~1920 target px. these multiply that so you don't need a huge DPI on the Xbox/game.
+// raise if still slow, lower if too fast.
+constexpr float kTouchGameplayGain = 3.0f;
+constexpr float kTouchMenuGain = 1.5f;
 
 #ifdef BANDIT_MOUSE_RELAY_TOUCH
 constexpr bool kTouchLayout = true;
@@ -723,7 +732,8 @@ public:
             return;
         case SDL_EVENT_FINGER_MOTION:
             if (!enteringIp_ && !menuOpen_ && !IsTouchControlFinger(event.tfinger.fingerID)) {
-                AddMotion(event.tfinger.dx * static_cast<float>(windowWidth_), event.tfinger.dy * static_cast<float>(windowHeight_));
+                const float gain = (mode_ == RelayMode::Menu) ? kTouchMenuGain : kTouchGameplayGain;
+                AddMotion(event.tfinger.dx * static_cast<float>(windowWidth_) * gain, event.tfinger.dy * static_cast<float>(windowHeight_) * gain);
             }
             return;
         default:
